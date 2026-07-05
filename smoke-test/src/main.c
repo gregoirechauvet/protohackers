@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdlib.h>
 
 #include <tcp.h>
@@ -26,11 +27,22 @@ parse_res parse_port(const char* input_port, ushort *out) {
   return PARSE_OK;
 }
 
+volatile sig_atomic_t keep_running = 1;
+
+void handle_sigint(int) {
+  keep_running = 0;
+}
+
 int main(int argc, char *argv[]) {
   if (argc == 1) {
     fprintf(stderr, "Usage: %s <port>\n", argv[0]);
     return 0;
   }
+
+  struct sigaction sa;
+  sa.sa_handler = handle_sigint;
+  sa.sa_flags = 0; // Explicitly NO SA_RESTART, so accept() gets interrupted
+  sigaction(SIGINT, &sa, nullptr);
 
   ushort port;
   if (parse_port(argv[1], &port) != PARSE_OK) {
@@ -45,6 +57,19 @@ int main(int argc, char *argv[]) {
   }
 
   printf("Server bound and listening...\n");
+
+  while (keep_running) {
+    auto client_fd = accept_client(server);
+    if (client_fd == -1) {
+      continue;
+    }
+
+    printf("Received client: %d\n", client_fd);
+    spawn_client(client_fd);
+  }
+
+  printf("Shutting down server...\n");
+  teardown(&server);
 
   return 0;
 }
