@@ -1,7 +1,6 @@
 use std::io::{BufReader, BufWriter, Error, ErrorKind, BufRead, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream, SocketAddr};
 use serde::{Deserialize, Serialize};
-use std::os::fd::AsRawFd;
 use std::thread;
 
 fn main() {
@@ -10,7 +9,13 @@ fn main() {
     println!("Server listening...");
 
     for stream in listener.incoming() {
-        let stream = stream.unwrap();
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to accept connection: {}", e);
+                continue;
+            }
+        };
 
         thread::spawn(|| {
             match handle_connection(stream) {
@@ -39,42 +44,42 @@ struct Response {
 
 struct ConnectionHandler {
     stream: TcpStream,
+    peer_addr: SocketAddr,
 }
 
 impl ConnectionHandler {
-    fn new(stream: TcpStream) -> Self {
-        println!("Connection established with client {}", stream.as_raw_fd());
-        ConnectionHandler { stream }
+    fn new(stream: TcpStream) -> Result<Self, Error> {
+        let peer_addr = stream.peer_addr()?;
+        println!("Connection established with client {}", peer_addr);
+        Ok(ConnectionHandler { stream, peer_addr })
     }
 
     fn handle(&mut self) -> Result<(), Error> {
-        let client_id = self.stream.as_raw_fd();
-
-        let mut buf_reader = BufReader::new(&self.stream);
+        let mut reader = BufReader::new(&self.stream);
+        let mut writer = BufWriter::new(&self.stream);
         let mut line_buffer = String::new();
 
         loop {
             line_buffer.clear();
-            let bytes_read = buf_reader.read_line(&mut line_buffer)?;
+            let bytes_read = reader.read_line(&mut line_buffer)?;
             if bytes_read == 0 {
                 break;
             }
 
-            println!("[Client {client_id}] Received payload: {line_buffer}");
+            println!("[Client {}] Received payload: {}", self.peer_addr, line_buffer.trim());
 
-            let new_buf_reader = BufReader::new(line_buffer.as_bytes());
-            let json_res = serde_json::from_reader::<_, InputPayload>(new_buf_reader);
-
-            let data = match json_res {
+            let data: InputPayload = match serde_json::from_str(&line_buffer) {
                 Ok(value) => value,
                 Err(err) => {
-                    self.stream.write_all(b"malformed")?;
+                    writer.write_all(b"malformed\n")?;
+                    writer.flush()?;
                     return Err(Error::new(ErrorKind::InvalidInput, format!("JSON parsing error: {}", err)));
                 }
             };
 
             if data.method != "isPrime" {
-                self.stream.write_all(b"malformed")?;
+                writer.write_all(b"malformed\n")?;
+                writer.flush()?;
                 return Err(Error::new(ErrorKind::InvalidInput, "Method not supported"));
             }
 
@@ -83,30 +88,27 @@ impl ConnectionHandler {
                 prime: is_prime(data.number),
             };
 
-            let serialized_response = serde_json::to_vec(&response)?;
-            let mut buf_writer = BufWriter::new(&self.stream);
-            buf_writer.write_all(&serialized_response)?;
-            buf_writer.write_all(b"\n")?;
-            buf_writer.flush()?;
+            serde_json::to_writer(&mut writer, &response)?;
+            writer.write_all(b"\n")?;
+            writer.flush()?;
         }
 
-        println!("[Client {client_id}] Disconnected");
+        println!("[Client {}] Disconnected", self.peer_addr);
         Ok(())
     }
 }
 
 impl Drop for ConnectionHandler {
     fn drop(&mut self) {
-        println!("Shutting down connection for client {}", self.stream.as_raw_fd());
+        println!("Shutting down connection for client {}", self.peer_addr);
         if let Err(e) = self.stream.shutdown(Shutdown::Both) {
-            eprintln!("Error shutting down stream for client {}: {}", self.stream.as_raw_fd(), e);
+            eprintln!("Error shutting down stream for {}: {}", self.peer_addr, e);
         }
     }
 }
 
 fn handle_connection(stream: TcpStream) -> Result<(), Error> {
-    let mut handler = ConnectionHandler::new(stream);
-    handler.handle()
+    ConnectionHandler::new(stream)?.handle()
 }
 
 fn is_prime(value: f64) -> bool {
