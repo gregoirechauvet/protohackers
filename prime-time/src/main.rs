@@ -2,6 +2,7 @@ use std::io::{BufReader, BufWriter, Error, ErrorKind, BufRead, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use serde::{Deserialize, Serialize};
 use std::os::fd::AsRawFd;
+use std::thread;
 
 fn main() {
     let listener = TcpListener::bind("0.0.0.0:8080").unwrap();
@@ -11,21 +12,23 @@ fn main() {
     for stream in listener.incoming() {
         let stream = stream.unwrap();
 
-        match handle_connection(stream) {
-            Ok(()) => {
-                println!("Client disconnected");
+        thread::spawn(|| {
+            match handle_connection(stream) {
+                Ok(()) => {
+                    println!("Client disconnected");
+                }
+                Err(e) => {
+                    eprintln!("Error handling connection: {}", e);
+                }
             }
-            Err(e) => {
-                eprintln!("Error handling connection: {}", e);
-            }
-        }
+        });
     }
 }
 
 #[derive(Serialize, Deserialize)]
 struct InputPayload {
     method: String,
-    value: f64,
+    number: f64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -51,6 +54,7 @@ impl ConnectionHandler {
         let mut line_buffer = String::new();
 
         loop {
+            line_buffer.clear();
             let bytes_read = buf_reader.read_line(&mut line_buffer)?;
             if bytes_read == 0 {
                 break;
@@ -76,7 +80,7 @@ impl ConnectionHandler {
 
             let response = Response {
                 method: "isPrime".to_owned(),
-                prime: is_prime(data.value),
+                prime: is_prime(data.number),
             };
 
             let serialized_response = serde_json::to_vec(&response)?;
