@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -71,28 +72,41 @@ void *handle_client(void *arg) {
   int read_res, write_res;
   do {
     read_res = read(client->fd, client->buffer, BUFFER_SIZE);
-    if (read_res == -1) {
+    if (read_res == -1 || read_res == 0) {
       break;
     }
 
-    printf("Content from client %d: %*.s", client->fd, read_res, client->buffer);
+    printf("Content from client %d: %.*s", client->fd, read_res, client->buffer);
 
     write_res = write(client->fd, client->buffer, read_res);
     if (write_res == -1) {
-      printf("Client %d disconnected", client->fd);
-      return nullptr;
+      break;
     }
   } while(read_res > 0);
 
-  printf("Client %d disconnected", client->fd);
+  printf("Client %d disconnected\n", client->fd);
+  close(client->fd);
+  free(client);
   return nullptr;
 }
 
 void spawn_client(int client_fd) {
-  pthread_t *thread = malloc(sizeof(pthread_t));
-  client_t *client = malloc(sizeof(client_t));
-  client->fd = client_fd;
+  pthread_t thread;
 
-  pthread_create(thread, nullptr, handle_client, client);
-  // pthread_detach(*thread);
+  client_t *client = malloc(sizeof(client_t));
+  if (client == nullptr) {
+    perror("malloc client_t");
+    close(client_fd);
+    return;
+  }
+
+  client->fd = client_fd;
+  if (pthread_create(&thread, nullptr, handle_client, client) != 0) {
+    perror("pthread_create");
+    close(client_fd);
+    free(client);
+    return;
+  }
+
+  pthread_detach(thread);
 }
