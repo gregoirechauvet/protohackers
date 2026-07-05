@@ -76,7 +76,7 @@ impl ConnectionHandler {
 
             let response = Response {
                 method: "isPrime".to_owned(),
-                prime: false,
+                prime: is_prime(data.value),
             };
 
             let serialized_response = serde_json::to_vec(&response)?;
@@ -103,4 +103,27 @@ impl Drop for ConnectionHandler {
 fn handle_connection(stream: TcpStream) -> Result<(), Error> {
     let mut handler = ConnectionHandler::new(stream);
     handler.handle()
+}
+
+fn is_prime(value: f64) -> bool {
+    let integer = value as i64;
+    if integer as f64 != value || integer <= 1 {
+        return false;
+    }
+
+    if integer == 2 {
+        return true;
+    }
+
+    if integer % 2 == 0 {
+        return false;
+    }
+
+    for i in (3..=integer.isqrt()).step_by(2) {
+        if integer % i == 0 {
+            return false;
+        }
+    }
+
+    true
 }
