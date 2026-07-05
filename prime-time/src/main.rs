@@ -1,6 +1,6 @@
-use std::io::{BufReader, BufWriter, Error, ErrorKind, BufRead, Write};
-use std::net::{Shutdown, TcpListener, TcpStream, SocketAddr};
 use serde::{Deserialize, Serialize};
+use std::io::{BufRead, BufReader, BufWriter, Error, ErrorKind, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::thread;
 
 fn main() {
@@ -17,14 +17,12 @@ fn main() {
             }
         };
 
-        thread::spawn(|| {
-            match handle_connection(stream) {
-                Ok(()) => {
-                    println!("Client disconnected");
-                }
-                Err(e) => {
-                    eprintln!("Error handling connection: {}", e);
-                }
+        thread::spawn(|| match handle_connection(stream) {
+            Ok(()) => {
+                println!("Client disconnected");
+            }
+            Err(e) => {
+                eprintln!("Error handling connection: {}", e);
             }
         });
     }
@@ -66,14 +64,21 @@ impl ConnectionHandler {
                 break;
             }
 
-            println!("[Client {}] Received payload: {}", self.peer_addr, line_buffer.trim());
+            println!(
+                "[Client {}] Received payload: {}",
+                self.peer_addr,
+                line_buffer.trim()
+            );
 
             let data: InputPayload = match serde_json::from_str(&line_buffer) {
                 Ok(value) => value,
                 Err(err) => {
                     writer.write_all(b"malformed\n")?;
                     writer.flush()?;
-                    return Err(Error::new(ErrorKind::InvalidInput, format!("JSON parsing error: {}", err)));
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("JSON parsing error: {}", err),
+                    ));
                 }
             };
 
