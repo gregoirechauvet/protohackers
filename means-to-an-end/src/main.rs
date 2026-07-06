@@ -101,7 +101,6 @@ impl Asset {
 
     fn insert_price(&mut self, timestamp: i32, price: i32) {
         self.prices.push(PricePoint { price, timestamp });
-        self.prices.sort_by(|a, b| a.timestamp.cmp(&b.timestamp))
     }
 
     fn query_mean(&self, from: i32, to: i32) -> i32 {
@@ -109,12 +108,12 @@ impl Asset {
             .prices
             .iter()
             .filter(|point| point.timestamp >= from && point.timestamp <= to)
-            .fold((0, 0), |(sum, count), point| (sum + point.price, count + 1));
+            .fold((0i64, 0i64), |(sum, count), point| (sum + point.price as i64, count + 1));
 
         if count == 0 {
             return 0;
         }
 
-        sum / count
+        (sum / count) as i32
     }
 }
