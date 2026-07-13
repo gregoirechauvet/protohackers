@@ -112,7 +112,7 @@ impl ChatRoom {
                     }
                 };
 
-                submission_entries.extend(entries?);
+                submission_entries.extend(entries);
             }
 
             unsafe {
@@ -123,10 +123,11 @@ impl ChatRoom {
         }
     }
 
-    fn handle_accept(&mut self, entry: CompletionEntry) -> Result<Vec<SubmissionEntry>, Error> {
+    fn handle_accept(&mut self, entry: CompletionEntry) -> Vec<SubmissionEntry> {
         let client_fd = entry.result();
         if client_fd < 0 {
-            return Err(Error::from_raw_os_error(-client_fd));
+            eprintln!("Error accepting new client: {}", Error::from_raw_os_error(-client_fd));
+            return vec![];
         }
 
         println!("Accepting client with fd: {client_fd}");
@@ -165,7 +166,7 @@ impl ChatRoom {
             _ => unreachable!("Got invalid read reference"),
         };
 
-        Ok(vec![welcome_submission, read_submission])
+        vec![welcome_submission, read_submission]
     }
 
     fn handle_read(
@@ -173,18 +174,18 @@ impl ChatRoom {
         entry: CompletionEntry,
         client_fd: i32,
         buffer: Vec<u8>,
-    ) -> Result<Vec<SubmissionEntry>, Error> {
+    ) -> Vec<SubmissionEntry> {
         let result = entry.result();
 
         if result <= 0 {
-            return Ok(vec![self.close(client_fd)]);
+            return vec![self.close(client_fd)];
         }
 
         let client = match self.clients.get_mut(&client_fd) {
             Some(client) => client,
             None => {
                 eprintln!("Got message from unknown client in chat room");
-                return Ok(vec![]);
+                return vec![];
             }
         };
 
@@ -212,7 +213,7 @@ impl ChatRoom {
         let line_break = match line_break_position {
             Some(value) => value,
             None => {
-                return Ok(vec![read_submission]);
+                return vec![read_submission];
             }
         };
 
@@ -221,13 +222,13 @@ impl ChatRoom {
             Ok(value) => value,
             Err(_) => {
                 eprintln!("Got invalid UTF-8 message from client");
-                return Ok(vec![self.close(client_fd)]);
+                return vec![self.close(client_fd)];
             }
         };
 
         message = message.trim_end().to_string();
         if message.is_empty() {
-            return Ok(vec![read_submission]);
+            return vec![read_submission];
         }
 
         let (broadcast_message, welcome_submission) = match &client.state {
@@ -236,7 +237,7 @@ impl ChatRoom {
             }
             State::Pending => {
                 if !is_name_valid(&message) {
-                    return Ok(vec![self.close(client_fd)]);
+                    return vec![self.close(client_fd)];
                 }
 
                 client.join(message.clone());
@@ -248,7 +249,7 @@ impl ChatRoom {
         broadcast_submissions.push(read_submission);
         broadcast_submissions.extend(welcome_submission);
 
-        Ok(broadcast_submissions)
+        broadcast_submissions
     }
 
     fn welcome(&mut self, welcome_fd: i32) -> SubmissionEntry {
@@ -290,21 +291,21 @@ impl ChatRoom {
         &mut self,
         entry: CompletionEntry,
         client_fd: i32,
-    ) -> Result<Vec<SubmissionEntry>, Error> {
+    ) -> Vec<SubmissionEntry> {
         let result = entry.result();
         if result < 0 {
             eprintln!("Error writing to client {client_fd}. Disconnecting...",);
-            return Ok(vec![self.close(client_fd)]);
+            return vec![self.close(client_fd)];
         }
 
-        Ok(vec![])
+        vec![]
     }
 
     fn handle_close(
         &mut self,
         entry: CompletionEntry,
         client_fd: i32,
-    ) -> Result<Vec<SubmissionEntry>, Error> {
+    ) -> Vec<SubmissionEntry> {
         println!("Client {client_fd} disconnected");
 
         let result = entry.result();
@@ -313,14 +314,14 @@ impl ChatRoom {
                 "Error closing client {client_fd}: {}",
                 Error::from_raw_os_error(-result)
             );
-            return Ok(vec![]);
+            return vec![];
         }
 
         let client = match self.clients.get(&client_fd) {
             Some(client) => client,
             None => {
                 eprintln!("Got close for unknown client {client_fd}");
-                return Ok(vec![]);
+                return vec![];
             }
         };
 
@@ -328,12 +329,12 @@ impl ChatRoom {
             State::Joined { name } => {
                 format!("* {name} has left the room\n")
             }
-            _ => return Ok(vec![]),
+            _ => return vec![],
         };
 
         self.clients.remove(&client_fd);
 
-        Ok(self.broadcast(message, client_fd))
+        self.broadcast(message, client_fd)
     }
 
     fn broadcast(&mut self, message: String, sender: i32) -> Vec<SubmissionEntry> {
