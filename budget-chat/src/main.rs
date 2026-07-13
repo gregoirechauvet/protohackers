@@ -235,6 +235,10 @@ impl ChatRoom {
                 (format!("[{name}] {message}\n"), None)
             }
             State::Pending => {
+                if !is_name_valid(&message) {
+                    return Ok(vec![self.close(client_fd)]);
+                }
+
                 client.join(message.clone());
                 (format!("* {message} joined the room\n"), Some(self.welcome(client_fd)))
             }
@@ -406,4 +410,14 @@ impl Client {
     fn join(&mut self, name: String) {
         self.state = State::Joined { name }
     }
+}
+
+const MAX_NAME_LENGTH: usize = 32;
+
+fn is_name_valid(name: &str) -> bool {
+    if name.len() > MAX_NAME_LENGTH {
+        return false;
+    }
+
+    name.chars().all(char::is_alphanumeric)
 }
