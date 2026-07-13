@@ -23,10 +23,35 @@ fn main() -> Result<(), Error> {
 }
 
 enum Op {
-    Accept,
+    Accept { listener_fd: i32 },
     Read { client_fd: i32, buffer: Vec<u8> },
     Write { client_fd: i32, buffer: String },
     Close { client_fd: i32 },
+}
+
+impl Op {
+    pub fn build_submission(&mut self, index: Index) -> SubmissionEntry {
+        match self {
+            Op::Accept { listener_fd } => opcode::AcceptMulti::new(types::Fd(*listener_fd))
+                .build()
+                .user_data(index.into_user_data()),
+            Op::Read { client_fd, buffer } => opcode::Read::new(
+                types::Fd(*client_fd),
+                buffer.as_mut_ptr(),
+                buffer.len() as _,
+            )
+            .build()
+            .user_data(index.into_user_data()),
+            Op::Write { client_fd, buffer } => {
+                opcode::Write::new(types::Fd(*client_fd), buffer.as_ptr(), buffer.len() as _)
+                    .build()
+                    .user_data(index.into_user_data())
+            }
+            Op::Close { client_fd } => opcode::Close::new(types::Fd(*client_fd))
+                .build()
+                .user_data(index.into_user_data()),
+        }
+    }
 }
 
 struct ChatRoom {
@@ -58,10 +83,8 @@ impl ChatRoom {
 
         self.listener = Some(listener);
 
-        let accept_op = self.ops.insert(Op::Accept);
-        let accept_submission = opcode::AcceptMulti::new(types::Fd(listener_fd))
-            .build()
-            .user_data(accept_op.into_user_data());
+        let (index, accept_ref) = self.ops.insert(Op::Accept { listener_fd });
+        let accept_submission = accept_ref.build_submission(index);
 
         unsafe {
             if let Err(_) = self.ring.submission().push(&accept_submission) {
@@ -90,26 +113,22 @@ impl ChatRoom {
                 let index = Index::from_user_data(entry.user_data());
 
                 let entries = match self.ops.get(index) {
-                    Some(Op::Accept) => {
-                        self.handle_accept(entry)
-                    },
-                    _ => {
-                        match self.ops.remove(index) {
-                            Some(Op::Accept) => self.handle_accept(entry),
-                            Some(Op::Read { client_fd, buffer }) => {
-                                self.handle_read(entry, client_fd, buffer)
-                            }
-                            Some(Op::Write {
-                                     client_fd,
-                                     buffer: _,
-                                 }) => self.handle_write(entry, client_fd),
-                            Some(Op::Close { client_fd }) => self.handle_close(entry, client_fd),
-                            None => {
-                                eprintln!("Got completion entry for unknown operation");
-                                continue;
-                            }
+                    Some(Op::Accept { .. }) => self.handle_accept(entry),
+                    _ => match self.ops.remove(index) {
+                        Some(Op::Accept { .. }) => unreachable!("Accept operation should not be removed from the arena."),
+                        Some(Op::Read { client_fd, buffer }) => {
+                            self.handle_read(entry, client_fd, buffer)
                         }
-                    }
+                        Some(Op::Write {
+                            client_fd,
+                            buffer: _,
+                        }) => self.handle_write(entry, client_fd),
+                        Some(Op::Close { client_fd }) => self.handle_close(entry, client_fd),
+                        None => {
+                            eprintln!("Got completion entry for unknown operation");
+                            continue;
+                        }
+                    },
                 };
 
                 submission_entries.extend(entries);
@@ -126,7 +145,10 @@ impl ChatRoom {
     fn handle_accept(&mut self, entry: CompletionEntry) -> Vec<SubmissionEntry> {
         let client_fd = entry.result();
         if client_fd < 0 {
-            eprintln!("Error accepting new client: {}", Error::from_raw_os_error(-client_fd));
+            eprintln!(
+                "Error accepting new client: {}",
+                Error::from_raw_os_error(-client_fd)
+            );
             return vec![];
         }
 
@@ -134,37 +156,17 @@ impl ChatRoom {
 
         self.clients.insert(client_fd, Client::new());
 
-        let index = self.ops.insert(Op::Write {
+        let (index, write_ref) = self.ops.insert(Op::Write {
             client_fd,
             buffer: WELCOME_MESSAGE.to_owned(),
         });
-        let write_ref = self.ops.get_mut(index);
+        let welcome_submission = write_ref.build_submission(index);
 
-        let welcome_submission = match write_ref {
-            Some(Op::Write {
-                client_fd: _,
-                buffer,
-            }) => opcode::Write::new(types::Fd(client_fd), buffer.as_ptr(), buffer.len() as _)
-                .build()
-                .user_data(index.into_user_data()),
-            _ => unreachable!("Got invalid write reference"),
-        };
-
-        let index = self.ops.insert(Op::Read {
+        let (index, read_ref) = self.ops.insert(Op::Read {
             client_fd,
             buffer: vec![0; 1024],
         });
-        let read_ref = self.ops.get_mut(index);
-
-        let read_submission = match read_ref {
-            Some(Op::Read {
-                client_fd: _,
-                buffer,
-            }) => opcode::Read::new(types::Fd(client_fd), buffer.as_mut_ptr(), buffer.len() as _)
-                .build()
-                .user_data(index.into_user_data()),
-            _ => unreachable!("Got invalid read reference"),
-        };
+        let read_submission = read_ref.build_submission(index);
 
         vec![welcome_submission, read_submission]
     }
@@ -192,22 +194,11 @@ impl ChatRoom {
         let bytes_read = result as usize;
         client.incoming.extend_from_slice(&buffer[..bytes_read]);
 
-        let index = self.ops.insert(Op::Read {
+        let (index, read_ref) = self.ops.insert(Op::Read {
             client_fd,
             buffer, // Reuse buffer
         });
-
-        let read_submission = match self.ops.get_mut(index) {
-            Some(Op::Read {
-                client_fd: _,
-                buffer,
-            }) => {
-                opcode::Read::new(types::Fd(client_fd), buffer.as_mut_ptr(), buffer.len() as _)
-                    .build()
-                    .user_data(index.into_user_data())
-            }
-            _ => unreachable!("Got invalid read reference"),
-        };
+        let read_submission = read_ref.build_submission(index);
 
         let line_break_position = client.incoming.iter().position(|&byte| byte == b'\n');
         let line_break = match line_break_position {
@@ -232,16 +223,17 @@ impl ChatRoom {
         }
 
         let (broadcast_message, welcome_submission) = match &client.state {
-            State::Joined { name } => {
-                (format!("[{name}] {message}\n"), None)
-            }
+            State::Joined { name } => (format!("[{name}] {message}\n"), None),
             State::Pending => {
                 if !is_name_valid(&message) {
                     return vec![self.close(client_fd)];
                 }
 
                 client.join(message.clone());
-                (format!("* {message} joined the room\n"), Some(self.welcome(client_fd)))
+                (
+                    format!("* {message} joined the room\n"),
+                    Some(self.welcome(client_fd)),
+                )
             }
         };
 
@@ -271,27 +263,15 @@ impl ChatRoom {
 
         let message = format!("* The room contains: {names}\n");
 
-        let index = self.ops.insert(Op::Write {
+        let (index, write_ref) = self.ops.insert(Op::Write {
             client_fd: welcome_fd,
             buffer: message,
         });
 
-        match self.ops.get_mut(index) {
-            Some(Op::Write {
-                client_fd: _,
-                buffer,
-            }) => opcode::Write::new(types::Fd(welcome_fd), buffer.as_ptr(), buffer.len() as _)
-                .build()
-                .user_data(index.into_user_data()),
-            _ => unreachable!("Got invalid write reference"),
-        }
+        write_ref.build_submission(index)
     }
 
-    fn handle_write(
-        &mut self,
-        entry: CompletionEntry,
-        client_fd: i32,
-    ) -> Vec<SubmissionEntry> {
+    fn handle_write(&mut self, entry: CompletionEntry, client_fd: i32) -> Vec<SubmissionEntry> {
         let result = entry.result();
         if result < 0 {
             eprintln!("Error writing to client {client_fd}. Disconnecting...",);
@@ -301,11 +281,7 @@ impl ChatRoom {
         vec![]
     }
 
-    fn handle_close(
-        &mut self,
-        entry: CompletionEntry,
-        client_fd: i32,
-    ) -> Vec<SubmissionEntry> {
+    fn handle_close(&mut self, entry: CompletionEntry, client_fd: i32) -> Vec<SubmissionEntry> {
         println!("Client {client_fd} disconnected");
 
         let result = entry.result();
@@ -357,34 +333,19 @@ impl ChatRoom {
         recipient_fds
             .iter()
             .map(|&client_fd| {
-                let index = self.ops.insert(Op::Write {
+                let (index, write_ref) = self.ops.insert(Op::Write {
                     client_fd,
                     buffer: message.clone(),
                 });
 
-                match self.ops.get_mut(index) {
-                    Some(Op::Write {
-                        client_fd: _,
-                        buffer,
-                    }) => {
-                        opcode::Write::new(types::Fd(client_fd), buffer.as_ptr(), buffer.len() as _)
-                            .build()
-                            .user_data(index.into_user_data())
-                    }
-                    _ => unreachable!("Got invalid write reference"),
-                }
+                write_ref.build_submission(index)
             })
             .collect()
     }
 
     fn close(&mut self, client_fd: i32) -> SubmissionEntry {
-        let index = self.ops.insert(Op::Close { client_fd });
-        match self.ops.get_mut(index) {
-            Some(Op::Close { client_fd: _ }) => opcode::Close::new(types::Fd(client_fd))
-                .build()
-                .user_data(index.into_user_data()),
-            _ => unreachable!("Got invalid close reference"),
-        }
+        let (index, close_ref) = self.ops.insert(Op::Close { client_fd });
+        close_ref.build_submission(index)
     }
 }
 

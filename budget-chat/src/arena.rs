@@ -46,7 +46,7 @@ impl<T> Arena<T> {
         }
     }
 
-    pub fn insert(&mut self, value: T) -> Index {
+    pub fn insert(&mut self, value: T) -> (Index, &mut T) {
         match self.free_head {
             Some(idx) => {
                 // Reuse an existing free slot
@@ -62,10 +62,17 @@ impl<T> Arena<T> {
                 // Occupy the slot. The version remains what it was.
                 entry.state = State::Occupied(value);
 
-                Index {
+                let return_value = match &mut entry.state {
+                    State::Occupied(x) => x,
+                    _ => unreachable!("Unknown state in arena"),
+                };
+
+                let index = Index {
                     idx,
                     version: entry.version,
-                }
+                };
+
+                (index, return_value)
             }
             None => {
                 // No free slots available, push a new one
@@ -77,7 +84,12 @@ impl<T> Arena<T> {
                     state: State::Occupied(value),
                 });
 
-                Index { idx, version }
+                let return_value = match &mut self.entries[idx as usize].state {
+                    State::Occupied(x) => x,
+                    _ => unreachable!("Unknown state in arena"),
+                };
+
+                (Index { idx, version }, return_value)
             }
         }
     }
@@ -120,21 +132,8 @@ impl<T> Arena<T> {
         if entry.version != index.version {
             return None;
         }
-        
+
         match &entry.state {
-            State::Occupied(value) => Some(value),
-            State::Free { .. } => None,
-        }
-    }
-
-    pub fn get_mut(&mut self, index: Index) -> Option<&mut T> {
-        let entry = self.entries.get_mut(index.idx as usize)?;
-
-        if entry.version != index.version {
-            return None;
-        }
-
-        match &mut entry.state {
             State::Occupied(value) => Some(value),
             State::Free { .. } => None,
         }
