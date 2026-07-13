@@ -232,22 +232,22 @@ impl ChatRoom {
 
         message = message.trim_end().to_string();
         if message.is_empty() {
-            // TODO
-            return Ok(vec![]);
+            return Ok(vec![read_submission]);
         }
 
-        let broadcast_message = match &client.state {
+        let (broadcast_message, welcome_submission) = match &client.state {
             State::Joined { name } => {
-                format!("[{name}]: {message}\n")
+                (format!("[{name}]: {message}\n"), None)
             }
             State::Pending => {
                 client.join(message.clone());
-                format!("* {message} joined the room\n")
+                (format!("* {message} joined the room\n"), Some(self.welcome(client_fd)))
             }
         };
 
         let mut broadcast_submissions = self.broadcast(broadcast_message, client_fd);
         broadcast_submissions.push(read_submission);
+        broadcast_submissions.extend(welcome_submission);
 
         Ok(broadcast_submissions)
     }
