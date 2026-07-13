@@ -1,3 +1,6 @@
+mod arena;
+
+use crate::arena::{Arena, Index};
 use io_uring::cqueue::Entry as CompletionEntry;
 use io_uring::squeue::Entry as SubmissionEntry;
 use io_uring::{IoUring, opcode, types};
@@ -12,44 +15,26 @@ const WELCOME_MESSAGE: &str = "Welcome to chat! What shall I call you?\n";
 
 fn main() -> Result<(), Error> {
     let mut chat_room = ChatRoom::new()?;
-    chat_room.listen()?;
+    chat_room.listen("0.0.0.0:8080")?;
 
     println!("Server listening...");
 
     chat_room.start()
 }
 
-#[repr(u8)]
 enum Op {
-    Accept = 1,
-    Read = 2,
-    Write = 3,
-    Close = 4,
-}
-
-fn make_user_data(op: Op, id: i32) -> u64 {
-    ((op as u64) << 32) | id as u64
-}
-
-fn user_data_op(user_data: u64) -> Option<Op> {
-    match user_data >> 32 {
-        1 => Some(Op::Accept),
-        2 => Some(Op::Read),
-        3 => Some(Op::Write),
-        4 => Some(Op::Close),
-        _ => None,
-    }
-}
-
-fn user_data_id(user_data: u64) -> i32 {
-    user_data as i32
+    Accept,
+    Read { client_fd: i32, buffer: Vec<u8> },
+    Write { client_fd: i32, buffer: String },
+    Close { client_fd: i32 },
 }
 
 struct ChatRoom {
     ring: IoUring,
-    clients: HashMap<i32, Client>,
-
     listener: Option<TcpListener>,
+
+    ops: Arena<Op>,
+    clients: HashMap<i32, Client>,
 }
 
 impl ChatRoom {
@@ -58,22 +43,25 @@ impl ChatRoom {
 
         let chat_room = ChatRoom {
             ring,
-            clients: HashMap::new(),
             listener: None,
+
+            ops: Arena::new(),
+            clients: HashMap::new(),
         };
 
         Ok(chat_room)
     }
 
-    fn listen(&mut self) -> Result<(), Error> {
-        let listener = TcpListener::bind("0.0.0.0:8080")?;
+    fn listen(&mut self, addr: &str) -> Result<(), Error> {
+        let listener = TcpListener::bind(addr)?;
         let listener_fd = listener.as_raw_fd();
 
         self.listener = Some(listener);
 
+        let accept_op = self.ops.insert(Op::Accept);
         let accept_submission = opcode::AcceptMulti::new(types::Fd(listener_fd))
             .build()
-            .user_data(make_user_data(Op::Accept, listener_fd));
+            .user_data(accept_op.into_user_data());
 
         unsafe {
             if let Err(_) = self.ring.submission().push(&accept_submission) {
@@ -99,13 +87,31 @@ impl ChatRoom {
             }
 
             for entry in completion_entries.drain(..) {
-                let entries = match user_data_op(entry.user_data()) {
-                    Some(Op::Accept) => self.handle_accept(entry),
-                    Some(Op::Read) => self.handle_read(entry),
-                    Some(Op::Write) => self.handle_write(entry),
-                    Some(Op::Close) => self.handle_close(entry),
-                    None => Err(Error::other("Unknown operation")),
+                let index = Index::from_user_data(entry.user_data());
+
+                let entries = match self.ops.get(index) {
+                    Some(Op::Accept) => {
+                        self.handle_accept(entry)
+                    },
+                    _ => {
+                        match self.ops.remove(index) {
+                            Some(Op::Accept) => self.handle_accept(entry),
+                            Some(Op::Read { client_fd, buffer }) => {
+                                self.handle_read(entry, client_fd, buffer)
+                            }
+                            Some(Op::Write {
+                                     client_fd,
+                                     buffer: _,
+                                 }) => self.handle_write(entry, client_fd),
+                            Some(Op::Close { client_fd }) => self.handle_close(entry, client_fd),
+                            None => {
+                                eprintln!("Got completion entry for unknown operation");
+                                continue;
+                            }
+                        }
+                    }
                 };
+
                 submission_entries.extend(entries?);
             }
 
@@ -125,157 +131,274 @@ impl ChatRoom {
 
         println!("Accepting client with fd: {client_fd}");
 
-        self.clients.insert(client_fd, Client::new(client_fd));
+        self.clients.insert(client_fd, Client::new());
 
-        let client = self.clients.get_mut(&client_fd).unwrap(); // Safe because we just inserted it
+        let index = self.ops.insert(Op::Write {
+            client_fd,
+            buffer: WELCOME_MESSAGE.to_owned(),
+        });
+        let write_ref = self.ops.get_mut(index);
 
-        let welcome_submission = opcode::Write::new(
-            types::Fd(client_fd),
-            WELCOME_MESSAGE.as_ptr(),
-            WELCOME_MESSAGE.len() as _,
-        )
-        .build()
-        .user_data(make_user_data(Op::Write, client_fd));
+        let welcome_submission = match write_ref {
+            Some(Op::Write {
+                client_fd: _,
+                buffer,
+            }) => opcode::Write::new(types::Fd(client_fd), buffer.as_ptr(), buffer.len() as _)
+                .build()
+                .user_data(index.into_user_data()),
+            _ => unreachable!("Got invalid write reference"),
+        };
 
-        let read_submission = opcode::Read::new(
-            types::Fd(client_fd),
-            client.buffer.as_mut_ptr(),
-            client.buffer.len() as _,
-        )
-        .build()
-        .user_data(make_user_data(Op::Read, client_fd));
+        let index = self.ops.insert(Op::Read {
+            client_fd,
+            buffer: vec![0; 1024],
+        });
+        let read_ref = self.ops.get_mut(index);
+
+        let read_submission = match read_ref {
+            Some(Op::Read {
+                client_fd: _,
+                buffer,
+            }) => opcode::Read::new(types::Fd(client_fd), buffer.as_mut_ptr(), buffer.len() as _)
+                .build()
+                .user_data(index.into_user_data()),
+            _ => unreachable!("Got invalid read reference"),
+        };
 
         Ok(vec![welcome_submission, read_submission])
     }
 
-    fn handle_read(&mut self, entry: CompletionEntry) -> Result<Vec<SubmissionEntry>, Error> {
-        let client_fd = user_data_id(entry.user_data());
+    fn handle_read(
+        &mut self,
+        entry: CompletionEntry,
+        client_fd: i32,
+        buffer: Vec<u8>,
+    ) -> Result<Vec<SubmissionEntry>, Error> {
         let result = entry.result();
+
+        if result <= 0 {
+            // TODO
+            // println!("Disconnecting client {}...", client.client_fd);
+            // client.disconnect();
+            // return Ok(vec![client.close()]);
+            return Ok(vec![]);
+        }
 
         let client = match self.clients.get_mut(&client_fd) {
             Some(client) => client,
             None => {
-                return Err(Error::other("Got message from unknown client in chat room"));
+                eprintln!("Got message from unknown client in chat room");
+                return Ok(vec![]);
             }
         };
-
-        if result <= 0 {
-            println!("Disconnecting client {}...", client.client_fd);
-            client.disconnect();
-            return Ok(vec![self.close_client(client_fd)]);
-        }
 
         let bytes_read = result as usize;
-        let message = match str::from_utf8(&client.buffer[..bytes_read]) {
-            Err(_) => {
-                println!("Got invalid UTF-8 message from client {}", client.client_fd);
-                return Err(Error::other("Got invalid UTF-8 message from client"));
+        client.incoming.extend_from_slice(&buffer[..bytes_read]);
+
+        let index = self.ops.insert(Op::Read {
+            client_fd,
+            buffer, // Reuse buffer
+        });
+
+        let read_submission = match self.ops.get_mut(index) {
+            Some(Op::Read {
+                client_fd: _,
+                buffer,
+            }) => {
+                opcode::Read::new(types::Fd(client_fd), buffer.as_mut_ptr(), buffer.len() as _)
+                    .build()
+                    .user_data(index.into_user_data())
             }
-            Ok(value) => {
-                println!("Got message: {value}");
-                value
+            _ => unreachable!("Got invalid read reference"),
+        };
+
+        let line_break_position = client.incoming.iter().position(|&byte| byte == b'\n');
+        let line_break = match line_break_position {
+            Some(value) => value,
+            None => {
+                return Ok(vec![read_submission]);
             }
         };
 
-        let stuff = match &client.state {
+        let frame = client.incoming.drain(..=line_break).collect::<Vec<_>>();
+        let mut message = match String::from_utf8(frame) {
+            Ok(value) => value,
+            Err(_) => {
+                eprintln!("Got invalid UTF-8 message from client");
+                // Disconnect client
+                return Ok(vec![]);
+            }
+        };
+
+        message = message.trim_end().to_string();
+        if message.is_empty() {
+            // TODO
+            return Ok(vec![]);
+        }
+
+        let broadcast_message = match &client.state {
             State::Joined { name } => {
                 format!("[{name}]: {message}\n")
             }
             State::Pending => {
-                // client.join(message);
+                client.join(message.clone());
                 format!("* {message} joined the room\n")
-            }
-            State::Disconnected => {
-                format!("* {message} has left the room\n")
             }
         };
 
-        Ok(self.broadcast(stuff, client_fd))
+        let mut broadcast_submissions = self.broadcast(broadcast_message, client_fd);
+        broadcast_submissions.push(read_submission);
+
+        Ok(broadcast_submissions)
     }
 
-    fn handle_write(&mut self, entry: CompletionEntry) -> Result<Vec<SubmissionEntry>, Error> {
-        let client_fd = user_data_id(entry.user_data());
+    fn welcome(&mut self, welcome_fd: i32) -> SubmissionEntry {
+        let names = self
+            .clients
+            .iter()
+            .filter_map(|(&fd, client)| {
+                if fd == welcome_fd {
+                    return None;
+                }
+
+                match &client.state {
+                    State::Joined { name } => Some(name.clone()),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<String>>()
+            .join(", ");
+
+        let message = format!("* The room contains: {names}\n");
+
+        let index = self.ops.insert(Op::Write {
+            client_fd: welcome_fd,
+            buffer: message,
+        });
+
+        match self.ops.get_mut(index) {
+            Some(Op::Write {
+                client_fd: _,
+                buffer,
+            }) => opcode::Write::new(types::Fd(welcome_fd), buffer.as_ptr(), buffer.len() as _)
+                .build()
+                .user_data(index.into_user_data()),
+            _ => unreachable!("Got invalid write reference"),
+        }
+    }
+
+    fn handle_write(
+        &mut self,
+        entry: CompletionEntry,
+        client_fd: i32,
+    ) -> Result<Vec<SubmissionEntry>, Error> {
         let result = entry.result();
         if result < 0 {
             eprintln!("Error writing to client {client_fd}");
             // Probably disconnect client
-            return Err(Error::from_raw_os_error(-result));
         }
+
         Ok(vec![])
     }
 
-    fn handle_close(&mut self, entry: CompletionEntry) -> Result<Vec<SubmissionEntry>, Error> {
-        let client_fd = user_data_id(entry.user_data());
+    fn handle_close(
+        &mut self,
+        entry: CompletionEntry,
+        client_fd: i32,
+    ) -> Result<Vec<SubmissionEntry>, Error> {
+        println!("Client {client_fd} disconnected");
+
         let result = entry.result();
         if result < 0 {
-            eprintln!("Error closing client {client_fd}");
-            return Err(Error::from_raw_os_error(-result));
+            eprintln!(
+                "Error closing client {client_fd}: {}",
+                Error::from_raw_os_error(-result)
+            );
+            return Ok(vec![]);
         }
 
-        println!("Client {client_fd} disconnected");
+        let client = match self.clients.get(&client_fd) {
+            Some(client) => client,
+            None => {
+                eprintln!("Got close for unknown client {client_fd}");
+                return Ok(vec![]);
+            }
+        };
+
+        let message = match &client.state {
+            State::Joined { name } => {
+                format!("* {name} has left the room")
+            }
+            _ => return Ok(vec![]),
+        };
+
         self.clients.remove(&client_fd);
 
-        Ok(vec![])
+        Ok(self.broadcast(message, client_fd))
     }
 
-    fn broadcast(&self, message: String, sender: i32) -> Vec<SubmissionEntry> {
-        self.clients
+    fn broadcast(&mut self, message: String, sender: i32) -> Vec<SubmissionEntry> {
+        let recipient_fds: Vec<i32> = self
+            .clients
             .iter()
-            .filter(|(client_fd, client)| {
-                if **client_fd == sender {
+            .filter(|&(client_fd, client)| {
+                if *client_fd == sender {
                     return false;
                 }
 
-                if let State::Joined { name: _ } = &client.state {
+                if let State::Joined { .. } = client.state {
                     return true;
                 }
                 false
             })
-            .map(|(client_fd, _)| {
-                opcode::Write::new(types::Fd(*client_fd), message.as_ptr(), message.len() as _)
-                    .build()
-                    .user_data(make_user_data(Op::Write, *client_fd))
-            })
-            .collect::<Vec<_>>()
-    }
+            .map(|(&client_fd, _)| client_fd)
+            .collect();
 
-    fn close_client(&self, client_fd: i32) -> SubmissionEntry {
-        opcode::Close::new(types::Fd(client_fd))
-            .build()
-            .user_data(make_user_data(Op::Close, client_fd))
+        recipient_fds
+            .iter()
+            .map(|&client_fd| {
+                let index = self.ops.insert(Op::Write {
+                    client_fd,
+                    buffer: message.clone(),
+                });
+
+                match self.ops.get_mut(index) {
+                    Some(Op::Write {
+                        client_fd: _,
+                        buffer,
+                    }) => {
+                        opcode::Write::new(types::Fd(client_fd), buffer.as_ptr(), buffer.len() as _)
+                            .build()
+                            .user_data(index.into_user_data())
+                    }
+                    _ => unreachable!("Got invalid write reference"),
+                }
+            })
+            .collect()
     }
 }
 
 enum State {
     Pending,
     Joined { name: String },
-    Disconnected,
 }
 
 struct Client {
-    client_fd: i32,
-    buffer: Vec<u8>, // Use Vec to allocate memory on the heap and keep stable memory pointer
-
     state: State,
+
+    incoming: Vec<u8>,
 }
 
 impl Client {
-    fn new(client_fd: i32) -> Self {
+    fn new() -> Self {
         Client {
-            client_fd,
-            buffer: vec![0u8; 4096],
-
             state: State::Pending,
+
+            incoming: Vec::new(),
         }
     }
 
-    fn join(&mut self, name: &str) {
-        self.state = State::Joined {
-            name: String::from(name),
-        }
-    }
-
-    fn disconnect(&mut self) {
-        self.state = State::Disconnected;
+    fn join(&mut self, name: String) {
+        self.state = State::Joined { name }
     }
 }
