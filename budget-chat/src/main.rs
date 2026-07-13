@@ -177,11 +177,7 @@ impl ChatRoom {
         let result = entry.result();
 
         if result <= 0 {
-            // TODO
-            // println!("Disconnecting client {}...", client.client_fd);
-            // client.disconnect();
-            // return Ok(vec![client.close()]);
-            return Ok(vec![]);
+            return Ok(vec![self.close(client_fd)]);
         }
 
         let client = match self.clients.get_mut(&client_fd) {
@@ -225,8 +221,7 @@ impl ChatRoom {
             Ok(value) => value,
             Err(_) => {
                 eprintln!("Got invalid UTF-8 message from client");
-                // Disconnect client
-                return Ok(vec![]);
+                return Ok(vec![self.close(client_fd)]);
             }
         };
 
@@ -237,7 +232,7 @@ impl ChatRoom {
 
         let (broadcast_message, welcome_submission) = match &client.state {
             State::Joined { name } => {
-                (format!("[{name}]: {message}\n"), None)
+                (format!("[{name}] {message}\n"), None)
             }
             State::Pending => {
                 client.join(message.clone());
@@ -294,8 +289,8 @@ impl ChatRoom {
     ) -> Result<Vec<SubmissionEntry>, Error> {
         let result = entry.result();
         if result < 0 {
-            eprintln!("Error writing to client {client_fd}");
-            // Probably disconnect client
+            eprintln!("Error writing to client {client_fd}. Disconnecting...",);
+            return Ok(vec![self.close(client_fd)]);
         }
 
         Ok(vec![])
@@ -327,7 +322,7 @@ impl ChatRoom {
 
         let message = match &client.state {
             State::Joined { name } => {
-                format!("* {name} has left the room")
+                format!("* {name} has left the room\n")
             }
             _ => return Ok(vec![]),
         };
@@ -375,6 +370,16 @@ impl ChatRoom {
                 }
             })
             .collect()
+    }
+
+    fn close(&mut self, client_fd: i32) -> SubmissionEntry {
+        let index = self.ops.insert(Op::Close { client_fd });
+        match self.ops.get_mut(index) {
+            Some(Op::Close { client_fd: _ }) => opcode::Close::new(types::Fd(client_fd))
+                .build()
+                .user_data(index.into_user_data()),
+            _ => unreachable!("Got invalid close reference"),
+        }
     }
 }
 
